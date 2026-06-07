@@ -16,9 +16,9 @@ The dataset contains over 100,000 hospital encounters for diabetic patients coll
     - 0 = Not readmitted within 30 days (>30 or NO)
 
 ## Team Members
-Selin Karadag
-Jordyn Gonzalez
-Kamran Shirazi
+- Selin Karadag
+- Jordyn Gonzalez
+- Kamran Shirazi
 
 ## Project Structure
 
