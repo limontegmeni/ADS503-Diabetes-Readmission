@@ -17,7 +17,7 @@ The dataset contains over 100,000 hospital encounters for diabetic patients coll
 
 ## Team Members
 - Selin Karadag
-- Jordyn Gonzalez
+- Jordyn Gonzales
 - Kamran Shirazi
 
 ## Project Structure
