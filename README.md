@@ -20,24 +20,10 @@ The dataset contains over 100,000 hospital encounters for diabetic patients coll
 - Jordyn Gonzales
 - Kamran Shirazi
 
-## Project Structure
-
-### EDA and Preprocessing
-- Missing value analysis
-- Missing value handling
-- Feature selection
-- Correlation analysis
-- Exploratory visualizations
-
-### Predictive Modeling
-- IN PROGRESS...
-
 ## Files
 - `eda_preprocessing.R` - Data cleaning, preprocessing, and exploratory data analysis
 - `diabetic_data.csv` - Source dataset
 - `IDS_mapping.csv` - Dataset mapping file
 
 ## Current Status
-Completed:
-- EDA
-- Data preprocessing
+Completed
