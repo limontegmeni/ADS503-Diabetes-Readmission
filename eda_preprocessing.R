@@ -57,10 +57,11 @@ diabetes_clean$diag_3[diabetes_clean$diag_3 == "?"] <- "Unknown"
 
 sort(colSums(diabetes_clean == "?"), decreasing = TRUE)
 
-# removing ID variables
+# removing ID variables and original target variable
 diabetes_clean <- diabetes_clean %>%
   select(-encounter_id,
-         -patient_nbr)
+         -patient_nbr,
+         -readmitted)
 
 dim(diabetes_clean)
 
