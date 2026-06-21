@@ -1,0 +1,485 @@
+---
+title: "Modeling"
+author: "Selin Karadag, Jordyn Gonzales, Kamran Shirazi"
+date: today
+format: html
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+The goal of this document is to build and compare predictive models for 30-day hospital readmission in diabetic patients. We are picking up from the EDA and preprocessing steps, using the cleaned dataset (`diabetes_clean`) produced in `eda_preprocessing.R`.
+
+We will compare three models:
+
+- Logistic Regression with LASSO regularization
+- Random Forest
+- XGBoost
+
+Our primary evaluation metric is ROC-AUC since the dataset is heavily imbalanced (\~89% not readmitted, \~11% readmitted). Accuracy alone would be misleading here.
+
+------------------------------------------------------------------------
+
+## Setup
+
+Loading all the packages we need for modeling, resampling, and evaluation.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(ROSE)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(MLmetrics)
+```
+
+Sourcing the preprocessing script to bring in `diabetes_clean`. The `exists()` check just confirms it loaded correctly.
+
+```{r}
+source("eda_preprocessing.R")
+exists("diabetes_clean")
+```
+
+Quick sanity check on the dimensions before we start modifying anything.
+
+```{r}
+dim(diabetes_clean)
+```
+
+------------------------------------------------------------------------
+
+## Feature Engineering
+
+Before splitting the data, we need to create a few new features and clean up some existing ones.
+
+### Age Encoding
+
+Age is stored as decade bands like `[50-60)` which models can't use directly as a numeric variable. We map each band to its midpoint so age can be treated as continuous.
+
+```{r}
+age_map <- c(
+  "[0-10)"   =  5, "[10-20)"  = 15, "[20-30)"  = 25,
+  "[30-40)"  = 35, "[40-50)"  = 45, "[50-60)"  = 55,
+  "[60-70)"  = 65, "[70-80)"  = 75, "[80-90)"  = 85,
+  "[90-100)" = 95
+)
+
+diabetes_clean$age_num <- age_map[diabetes_clean$age]
+
+# verifying the mapping looks right
+diabetes_clean %>% select(age, age_num) %>% head(5)
+```
+
+### Medication Count
+
+There are 23 individual medication columns, each with values like No/Steady/Up/Down. Instead of one-hot encoding all of them (which would add a lot of noise), we collapse them into a single count of how many medications were actively prescribed for each patient.
+
+Note: `read.csv()` converts hyphens in column names to dots, so `glyburide-metformin` becomes `glyburide.metformin` etc.
+
+```{r}
+med_cols <- c(
+  "metformin", "repaglinide", "nateglinide", "chlorpropamide",
+  "glimepiride", "acetohexamide", "glipizide", "glyburide",
+  "tolbutamide", "pioglitazone", "rosiglitazone", "acarbose",
+  "miglitol", "troglitazone", "tolazamide", "examide",
+  "citoglipton", "insulin", "glyburide.metformin",
+  "glipizide.metformin", "glimepiride.pioglitazone",
+  "metformin.rosiglitazone", "metformin.pioglitazone"
+)
+
+diabetes_clean$num_active_meds <- rowSums(
+  diabetes_clean[, med_cols] != "No"
+)
+
+# checking: row 2 has insulin=Up so should show 1, row 5 has 2 active meds
+diabetes_clean %>% select(insulin, metformin, num_active_meds) %>% head(5)
+```
+
+### ICD-9 Diagnosis Grouping
+
+The diagnosis columns (`diag_1`, `diag_2`, `diag_3`) have thousands of unique ICD-9 codes. We group them into 9 broad clinical categories to reduce cardinality while keeping the clinical signal.
+
+```{r}
+icd_chapter <- function(code) {
+  code <- suppressWarnings(as.numeric(code))
+  case_when(
+    is.na(code)              ~ "Other",
+    code >= 390 & code < 460 ~ "Circulatory",
+    code >= 460 & code < 520 ~ "Respiratory",
+    code >= 520 & code < 580 ~ "Digestive",
+    code >= 580 & code < 630 ~ "Genitourinary",
+    code >= 240 & code < 280 ~ "Endocrine",
+    code >= 800 & code < 1000~ "Injury",
+    code >= 140 & code < 240 ~ "Neoplasms",
+    code >= 710 & code < 740 ~ "Musculoskeletal",
+    code >= 290 & code < 320 ~ "Mental",
+    TRUE                     ~ "Other"
+  )
+}
+
+diabetes_clean$diag_1_cat <- icd_chapter(diabetes_clean$diag_1)
+diabetes_clean$diag_2_cat <- icd_chapter(diabetes_clean$diag_2)
+diabetes_clean$diag_3_cat <- icd_chapter(diabetes_clean$diag_3)
+
+# spot check - 250.83 should map to Endocrine (diabetes codes are 250.xx)
+diabetes_clean %>% select(diag_1, diag_1_cat) %>% head(5)
+```
+
+### Final Modeling Dataset
+
+Selecting the features we want to use and converting character columns to factors so caret can handle them properly.
+
+```{r}
+diabetes_model <- diabetes_clean %>%
+  select(
+    age_num, time_in_hospital, num_lab_procedures, num_procedures,
+    num_medications, number_outpatient, number_emergency,
+    number_inpatient, number_diagnoses, num_active_meds,
+    race, gender, admission_type_id, discharge_disposition_id,
+    admission_source_id, max_glu_serum, A1Cresult, change,
+    diabetesMed, diag_1_cat, diag_2_cat, diag_3_cat,
+    readmitted_binary
+  ) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(across(c(admission_type_id,
+                  discharge_disposition_id,
+                  admission_source_id), as.factor))
+
+dim(diabetes_model)
+```
+
+Checking class balance before we split. We expect around 89/11 — this imbalance is why we use AUC instead of accuracy.
+
+```{r}
+prop.table(table(diabetes_model$readmitted_binary))
+```
+
+------------------------------------------------------------------------
+
+## Data Splitting
+
+We use a 70/15/15 stratified split. Stratifying on the target variable makes sure the \~11% minority class shows up proportionally in all three sets. The test set is carved out first and won't be touched until the very end.
+
+### Step 1 — Hold out 15% as the test set
+
+```{r}
+set.seed(503)
+
+test_index <- createDataPartition(
+  y    = diabetes_model$readmitted_binary,
+  p    = 0.15,
+  list = FALSE
+)
+
+test_set <- diabetes_model[ test_index, ]
+temp_set <- diabetes_model[-test_index, ]   # remaining 85%
+
+nrow(test_set)
+nrow(temp_set)
+```
+
+### Step 2 — Split the remaining 85% into train and validation
+
+We use p = 0.176 here because 0.176 x 0.85 ≈ 0.15 of the original data, giving us the \~15% validation set we want.
+
+```{r}
+val_index <- createDataPartition(
+  y    = temp_set$readmitted_binary,
+  p    = 0.176,
+  list = FALSE
+)
+
+val_set   <- temp_set[ val_index, ]
+train_set <- temp_set[-val_index, ]
+
+nrow(train_set)
+nrow(val_set)
+nrow(test_set)
+```
+
+### Verify class balance across all three sets
+
+All three should be close to 0.11. If they were very different it would mean the stratification didn't work.
+
+```{r}
+mean(train_set$readmitted_binary)
+mean(val_set$readmitted_binary)
+mean(test_set$readmitted_binary)
+```
+
+### Handle Class Imbalance with ROSE
+
+ROSE generates synthetic minority class samples to balance the training set to roughly 50/50. We only apply this to the training set — doing it to the validation or test sets would give us an unrealistic picture of performance.
+
+```{r}
+train_balanced <- ROSE(
+  readmitted_binary ~ .,
+  data = train_set,
+  seed = 503
+)$data
+
+prop.table(table(train_balanced$readmitted_binary))
+```
+
+------------------------------------------------------------------------
+
+## Preprocessing
+
+Centering and scaling the numeric features, and removing any near-zero variance columns. Importantly, we fit the preprocessor on the training data only, then apply the same transformation to val and test. Fitting on all the data first would be data leakage.
+
+```{r}
+pre_proc <- preProcess(
+  train_balanced %>% select(-readmitted_binary),
+  method = c("center", "scale", "nzv")
+)
+
+X_train <- predict(pre_proc, train_balanced %>% select(-readmitted_binary))
+X_val   <- predict(pre_proc, val_set        %>% select(-readmitted_binary))
+X_test  <- predict(pre_proc, test_set       %>% select(-readmitted_binary))
+
+y_train <- factor(train_balanced$readmitted_binary,
+                  levels = c(0, 1), labels = c("No", "Yes"))
+y_val   <- factor(val_set$readmitted_binary,
+                  levels = c(0, 1), labels = c("No", "Yes"))
+y_test  <- factor(test_set$readmitted_binary,
+                  levels = c(0, 1), labels = c("No", "Yes"))
+
+dim(X_train)
+```
+
+------------------------------------------------------------------------
+
+## Model Training
+
+All three models use the same 5-fold cross-validation setup so the results are directly comparable. We tune on ROC-AUC.
+
+```{r}
+cv_ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,        # needed to compute ROC
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+```
+
+### Model 1 — Logistic Regression (LASSO)
+
+LASSO adds a penalty that shrinks less important feature coefficients to zero. This gives us a simpler, more interpretable model and acts as a good baseline. We tune the penalty strength (`lambda`) across 20 values on a log scale.
+
+```{r}
+set.seed(503)
+m1_lasso <- train(
+  x         = X_train,
+  y         = y_train,
+  method    = "glmnet",
+  family    = "binomial",
+  trControl = cv_ctrl,
+  metric    = "ROC",
+  tuneGrid  = expand.grid(
+    alpha  = 1,                             # alpha=1 means LASSO
+    lambda = 10^seq(-4, 0, length.out = 20) # testing 20 lambda values
+  )
+)
+
+print(m1_lasso)
+```
+
+### Model 2 — Random Forest
+
+Random Forest builds many decision trees on random subsets of the data and features, then averages their predictions. It handles non-linear relationships well. We tune `mtry`, which controls how many features each tree considers at each split.
+
+```{r}
+set.seed(503)
+m2_rf <- train(
+  x         = X_train,
+  y         = y_train,
+  method    = "rf",
+  trControl = cv_ctrl,
+  metric    = "ROC",
+  tuneGrid  = data.frame(mtry = c(4, 6, 8, 10)),
+  ntree     = 300
+)
+
+print(m2_rf)
+```
+
+### Model 3 — XGBoost
+
+XGBoost requires a numeric matrix (no factors), so we use `model.matrix()` to dummy-encode the categorical variables first. We also shuffle the training data because ROSE places all the minority class rows at the end, which causes cross-validation folds to have no "Yes" cases.
+
+```{r}
+# convert to numeric matrix for XGBoost
+X_train_mat <- model.matrix(~ . - 1, data = X_train)
+X_val_mat   <- model.matrix(~ . - 1, data = X_val)
+X_test_mat  <- model.matrix(~ . - 1, data = X_test)
+```
+
+```{r}
+# shuffle so Yes/No cases are mixed throughout (not all at the end)
+set.seed(503)
+shuffle_idx  <- sample(length(y_train))
+X_train_mat  <- X_train_mat[shuffle_idx, ]
+y_train_shuf <- y_train[shuffle_idx]
+```
+
+XGBoost builds trees sequentially, each one correcting the errors of the previous one. We tune learning rate (`eta`), tree depth (`max_depth`), and number of trees (`nrounds`).
+
+```{r}
+set.seed(503)
+m3_xgb <- train(
+  x         = X_train_mat,
+  y         = y_train_shuf,
+  method    = "xgbTree",
+  trControl = cv_ctrl,
+  metric    = "ROC",
+  tuneGrid  = expand.grid(
+    nrounds          = c(100, 200),
+    max_depth        = c(4, 6),
+    eta              = c(0.05, 0.1),
+    gamma            = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample        = 0.8
+  ),
+  verbose = 0
+)
+```
+
+```{r}
+print(m3_xgb)
+```
+
+------------------------------------------------------------------------
+
+## Validation Set Evaluation
+
+Now we evaluate all three models on the validation set to pick the best one. The test set is still untouched at this point.
+
+```{r}
+# reusable function that returns AUC, confusion matrix, and ROC object
+evaluate_model <- function(model, X, y_true, model_name) {
+  prob    <- predict(model, newdata = X, type = "prob")[, "Yes"]
+  pred    <- predict(model, newdata = X)
+  roc_obj <- roc(response  = y_true,
+                 predictor = prob,
+                 levels    = c("No", "Yes"),
+                 quiet     = TRUE)
+  cm <- confusionMatrix(pred, y_true, positive = "Yes")
+  
+  list(
+    roc  = roc_obj,
+    cm   = cm,
+    auc  = as.numeric(auc(roc_obj)),
+    probs = prob,
+    name = model_name
+  )
+}
+```
+
+```{r}
+# note: XGBoost uses X_val_mat (matrix) while the others use X_val (data frame)
+val_m1 <- evaluate_model(m1_lasso, X_val,     y_val, "Logistic (LASSO)")
+val_m2 <- evaluate_model(m2_rf,    X_val,     y_val, "Random Forest")
+val_m3 <- evaluate_model(m3_xgb,   X_val_mat, y_val, "XGBoost")
+```
+
+```{r}
+cat("Logistic (LASSO):\n")
+cat("AUC:", round(val_m1$auc, 4), "\n")
+cat("Sensitivity:", round(val_m1$cm$byClass["Sensitivity"], 4), "\n")
+cat("Specificity:", round(val_m1$cm$byClass["Specificity"], 4), "\n\n")
+
+cat("Random Forest:\n")
+cat("AUC:", round(val_m2$auc, 4), "\n")
+cat("Sensitivity:", round(val_m2$cm$byClass["Sensitivity"], 4), "\n")
+cat("Specificity:", round(val_m2$cm$byClass["Specificity"], 4), "\n\n")
+
+cat("XGBoost:\n")
+cat("AUC:", round(val_m3$auc, 4), "\n")
+cat("Sensitivity:", round(val_m3$cm$byClass["Sensitivity"], 4), "\n")
+cat("Specificity:", round(val_m3$cm$byClass["Specificity"], 4), "\n")
+```
+
+### ROC Curves
+
+Plotting all three ROC curves together to visually compare model performance.
+
+```{r}
+plot(val_m1$roc, col = "steelblue",  lwd = 2,
+     main = "Validation Set ROC Curves")
+plot(val_m2$roc, col = "darkorange", lwd = 2, add = TRUE)
+plot(val_m3$roc, col = "darkgreen",  lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic (AUC = ",      round(val_m1$auc, 3), ")"),
+         paste0("Random Forest (AUC = ", round(val_m2$auc, 3), ")"),
+         paste0("XGBoost (AUC = ",       round(val_m3$auc, 3), ")")
+       ),
+       col = c("steelblue", "darkorange", "darkgreen"),
+       lwd = 2)
+```
+
+------------------------------------------------------------------------
+
+## Final Test Set Evaluation
+
+XGBoost had the highest validation AUC so we use it as our final model. We run it against the held-out test set exactly once.
+
+```{r}
+test_result <- evaluate_model(m3_xgb, X_test_mat, y_test, "XGBoost — Final Test")
+
+cat("AUC:         ", round(test_result$auc, 4), "\n")
+cat("Sensitivity: ", round(test_result$cm$byClass["Sensitivity"], 4), "\n")
+cat("Specificity: ", round(test_result$cm$byClass["Specificity"], 4), "\n")
+cat("F1 Score:    ", round(test_result$cm$byClass["F1"], 4), "\n")
+cat("Balanced Acc:", round(test_result$cm$byClass["Balanced Accuracy"], 4), "\n\n")
+cat("Confusion Matrix:\n")
+print(test_result$cm$table)
+```
+
+------------------------------------------------------------------------
+
+## Variable Importance
+
+Looking at which features the XGBoost model relied on most. This helps answer the research question of what actually drives 30-day readmission.
+
+```{r}
+var_imp <- varImp(m3_xgb, scale = TRUE)
+plot(var_imp, top = 20, main = "Top 20 Variable Importances — XGBoost")
+```
+
+------------------------------------------------------------------------
+
+## Model Comparison Summary
+
+```{r}
+summary_df <- data.frame(
+  Model       = c("Logistic (LASSO)", "Random Forest", "XGBoost"),
+  Val_AUC     = round(c(val_m1$auc, val_m2$auc, val_m3$auc), 4),
+  Val_Sens    = round(c(
+    val_m1$cm$byClass["Sensitivity"],
+    val_m2$cm$byClass["Sensitivity"],
+    val_m3$cm$byClass["Sensitivity"]
+  ), 4),
+  Val_Spec    = round(c(
+    val_m1$cm$byClass["Specificity"],
+    val_m2$cm$byClass["Specificity"],
+    val_m3$cm$byClass["Specificity"]
+  ), 4),
+  Val_F1      = round(c(
+    val_m1$cm$byClass["F1"],
+    val_m2$cm$byClass["F1"],
+    val_m3$cm$byClass["F1"]
+  ), 4)
+)
+
+print(summary_df)
+```
+
+XGBoost had the best overall AUC on both validation and test sets. The logistic regression model had the highest sensitivity, meaning it caught more true readmissions but at the cost of more false positives. In a clinical setting, the tradeoff between sensitivity and specificity would depend on the cost of missing a readmission vs. the cost of unnecessary interventions.

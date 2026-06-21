@@ -1,0 +1,357 @@
+---
+title: "ADS503 — Diabetes Readmission: EDA & Preprocessing"
+author: "Selin Karadag, Jordyn Gonzales, Kamran Shirazi"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+This document covers exploratory data analysis (EDA) and preprocessing for the **Diabetes 130-US Hospitals (1999–2008)** dataset. The goal is to understand the data structure, handle missing values, and prepare a clean dataset for predictive modeling of 30-day hospital readmissions.
+
+**Response variable:** `readmitted_binary`
+
+- `1` = Readmitted within 30 days
+- `0` = Not readmitted within 30 days (\>30 or NO)
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(corrplot)
+```
+
+------------------------------------------------------------------------
+
+## 1. Data Loading
+
+```{r}
+#| label: load-data
+
+diabetes <- read.csv("diabetic_data.csv")
+mapping  <- read.csv("IDS_mapping.csv")
+```
+
+```{r}
+#| label: data-check
+
+dim(diabetes)
+dim(mapping)
+names(diabetes)
+```
+
+The dataset contains **`r nrow(diabetes)` rows** and **`r ncol(diabetes)` columns**.
+
+------------------------------------------------------------------------
+
+## 2. Response Variable
+
+### 2.1 Raw Distribution
+
+```{r}
+#| label: response-raw
+
+table(diabetes$readmitted)
+prop.table(table(diabetes$readmitted))
+```
+
+### 2.2 Create Binary Target
+
+Patients readmitted in fewer than 30 days are coded `1`; all others are coded `0`.
+
+```{r}
+#| label: create-target
+
+diabetes$readmitted_binary <- ifelse(
+  diabetes$readmitted == "<30",
+  1,
+  0
+)
+
+table(diabetes$readmitted_binary)
+prop.table(table(diabetes$readmitted_binary))
+```
+
+The dataset is **imbalanced** — only \~`r round(mean(diabetes$readmitted_binary) * 100, 1)`% of encounters result in a 30-day readmission.
+
+------------------------------------------------------------------------
+
+## 3. Missing Value Analysis
+
+### 3.1 Identify Missing Values
+
+Missing values in this dataset are encoded as `"?"` rather than `NA`.
+
+```{r}
+#| label: missing-raw
+
+sort(colSums(diabetes == "?"), decreasing = TRUE)
+```
+
+### 3.2 Calculate Missing Percentages
+
+```{r}
+#| label: missing-pct
+
+missing_pct <- round(
+  colSums(diabetes == "?") / nrow(diabetes) * 100,
+  2
+)
+
+sort(missing_pct, decreasing = TRUE)
+```
+
+------------------------------------------------------------------------
+
+## 4. Preprocessing
+
+### 4.1 Drop High-Missing Columns
+
+`weight`, `medical_specialty`, and `payer_code` exceed acceptable missing thresholds and are removed.
+
+```{r}
+#| label: drop-columns
+
+diabetes_clean <- diabetes %>%
+  select(-weight,
+         -medical_specialty,
+         -payer_code)
+
+dim(diabetes_clean)
+```
+
+### 4.2 Remaining Missing Values
+
+```{r}
+#| label: missing-after-drop
+
+sort(colSums(diabetes_clean == "?"), decreasing = TRUE)
+```
+
+### 4.3 Impute Remaining `?` as "Unknown"
+
+```{r}
+#| label: impute-unknown
+
+diabetes_clean$race[diabetes_clean$race == "?"]     <- "Unknown"
+diabetes_clean$diag_1[diabetes_clean$diag_1 == "?"] <- "Unknown"
+diabetes_clean$diag_2[diabetes_clean$diag_2 == "?"] <- "Unknown"
+diabetes_clean$diag_3[diabetes_clean$diag_3 == "?"] <- "Unknown"
+
+sort(colSums(diabetes_clean == "?"), decreasing = TRUE)
+```
+
+### 4.4 Remove ID Columns
+
+`encounter_id` and `patient_nbr` are identifiers with no predictive value.
+
+```{r}
+#| label: drop-ids
+
+diabetes_clean <- diabetes_clean %>%
+  select(-encounter_id,
+         -patient_nbr)
+
+dim(diabetes_clean)
+```
+
+The cleaned dataset has **`r nrow(diabetes_clean)` rows** and **`r ncol(diabetes_clean)` columns**.
+
+------------------------------------------------------------------------
+
+## 5. Correlation Analysis
+
+Correlation matrix across all numeric features.
+
+```{r}
+#| label: correlation
+#| fig-width: 8
+#| fig-height: 7
+
+numeric_vars <- diabetes_clean %>%
+  select(where(is.numeric))
+
+cor_matrix <- cor(numeric_vars)
+
+corrplot(cor_matrix,
+         method = "color",
+         type   = "upper",
+         tl.cex = 0.8)
+```
+
+------------------------------------------------------------------------
+
+## 6. Predictor Exploration
+
+Mean values of key numeric predictors split by readmission status, to identify the strongest signals before modeling.
+
+```{r}
+#| label: predictor-means
+
+aggregate(number_inpatient ~ readmitted_binary,
+          data = diabetes_clean, FUN = mean)
+
+aggregate(number_emergency ~ readmitted_binary,
+          data = diabetes_clean, FUN = mean)
+
+aggregate(num_medications ~ readmitted_binary,
+          data = diabetes_clean, FUN = mean)
+
+aggregate(time_in_hospital ~ readmitted_binary,
+          data = diabetes_clean, FUN = mean)
+
+aggregate(number_diagnoses ~ readmitted_binary,
+          data = diabetes_clean, FUN = mean)
+```
+
+------------------------------------------------------------------------
+
+## 7. Exploratory Visualizations
+
+### 7.1 Target Variable Distribution
+
+```{r}
+#| label: fig-target
+#| fig-cap: "Distribution of 30-day readmission outcomes."
+
+ggplot(diabetes_clean,
+       aes(x = factor(readmitted_binary))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Distribution of 30-Day Readmissions",
+    x     = "Readmitted Within 30 Days (0 = No, 1 = Yes)",
+    y     = "Count"
+  )
+```
+
+### 7.2 Time in Hospital
+
+```{r}
+#| label: fig-time
+#| fig-cap: "Distribution of length of stay."
+
+ggplot(diabetes_clean,
+       aes(x = time_in_hospital)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Time in Hospital",
+    x     = "Days in Hospital",
+    y     = "Count"
+  )
+```
+
+### 7.3 Readmission Rate by Age Group
+
+```{r}
+#| label: fig-age
+#| fig-cap: "Proportion of readmissions by age group."
+
+ggplot(diabetes_clean,
+       aes(x    = age,
+           fill = factor(readmitted_binary))) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Readmission Rate by Age Group",
+    x     = "Age Group",
+    y     = "Proportion",
+    fill  = "Readmitted"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 7.4 Prior Inpatient Visits vs. Readmission
+
+```{r}
+#| label: fig-inpatient
+#| fig-cap: "Prior inpatient visits by readmission status."
+
+ggplot(diabetes_clean,
+       aes(x = factor(readmitted_binary),
+           y = number_inpatient)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Prior Inpatient Visits by Readmission Status",
+    x     = "Readmitted Within 30 Days (0 = No, 1 = Yes)",
+    y     = "Number of Prior Inpatient Visits"
+  )
+```
+
+### 7.5 Prior Emergency Visits vs. Readmission
+
+```{r}
+#| label: fig-emergency
+#| fig-cap: "Prior emergency visits by readmission status."
+
+ggplot(diabetes_clean,
+       aes(x = factor(readmitted_binary),
+           y = number_emergency)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Prior Emergency Visits by Readmission Status",
+    x     = "Readmitted Within 30 Days (0 = No, 1 = Yes)",
+    y     = "Number of Prior Emergency Visits"
+  )
+```
+
+### 7.6 Number of Diagnoses vs. Readmission
+
+```{r}
+#| label: fig-diagnoses
+#| fig-cap: "Number of diagnoses by readmission status."
+
+ggplot(diabetes_clean,
+       aes(x = factor(readmitted_binary),
+           y = number_diagnoses)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Number of Diagnoses by Readmission Status",
+    x     = "Readmitted Within 30 Days (0 = No, 1 = Yes)",
+    y     = "Number of Diagnoses"
+  )
+```
+
+### 7.7 Number of Medications vs. Readmission
+
+```{r}
+#| label: fig-medications
+#| fig-cap: "Number of medications by readmission status."
+
+ggplot(diabetes_clean,
+       aes(x = factor(readmitted_binary),
+           y = num_medications)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Number of Medications by Readmission Status",
+    x     = "Readmitted Within 30 Days (0 = No, 1 = Yes)",
+    y     = "Number of Medications"
+  )
+```
+
+------------------------------------------------------------------------
+
+## 8. Summary
+
+The preprocessing pipeline:
+
+1.  Encoded the response variable as a binary outcome (`readmitted_binary`)
+2.  Removed three high-missingness columns: `weight`, `medical_specialty`, `payer_code`
+3.  Replaced remaining `"?"` values with `"Unknown"` in `race`, `diag_1`, `diag_2`, `diag_3`
+4.  Dropped identifier columns `encounter_id` and `patient_nbr`
+
+The resulting `diabetes_clean` dataset is ready for feature engineering and predictive modeling.
